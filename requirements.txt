@@ -1,0 +1,5 @@
+Pillow>=10.0
+qrcode>=7.4
+pyyaml>=6.0
+pystray>=0.19
+imageio-ffmpeg>=0.6
