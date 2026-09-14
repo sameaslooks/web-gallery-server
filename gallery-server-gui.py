@@ -88,7 +88,7 @@ except Exception:
 
 # Browser-friendly codecs (played as-is)
 BROWSER_VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mov", ".ogv"}
-
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 # ---------------------------------------------------------------------------
 # i18n
@@ -292,7 +292,8 @@ class ThumbCache:
                 ]
                 try:
                     res = subprocess.run(
-                        cmd, capture_output=True, timeout=15, check=False
+                        cmd, capture_output=True, timeout=15, check=False,
+                        creationflags=_CREATE_NO_WINDOW,
                     )
                 except Exception:
                     continue
@@ -869,6 +870,8 @@ class GalleryHandler(BaseHTTPRequestHandler):
         Direct stream for browser-friendly formats; on-the-fly transcode
         via ffmpeg for the rest (mkv, avi, hevc, etc). Falls back to
         plain file serve if ffmpeg is missing.
+
+        ffmpeg is force-killed when the client disconnects or on any error.
         """
         if not self._check_token():
             return
@@ -899,31 +902,64 @@ class GalleryHandler(BaseHTTPRequestHandler):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
                 bufsize=0,
+                creationflags=_CREATE_NO_WINDOW,
             )
         except Exception as e:
             self._send_text(f"transcode failed: {e}", status=500)
             return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
             while True:
-                chunk = proc.stdout.read(65536)
+                # Read with a small timeout so we can detect a dead client
+                # and kill the ffmpeg process.
+                try:
+                    chunk = proc.stdout.read(65536)
+                except Exception:
+                    break
                 if not chunk:
                     break
-                self.wfile.write(f"{len(chunk):X}\r\n".encode())
-                self.wfile.write(chunk)
-                self.wfile.write(b"\r\n")
-            self.wfile.write(b"0\r\n\r\n")
+                try:
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode())
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+                except Exception:
+                    # Client went away — break and kill ffmpeg below.
+                    break
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+            except Exception:
+                pass
         except Exception:
             pass
         finally:
+            # Hard kill: terminate, then kill, then wait.
             try:
-                proc.kill()
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                    if proc.poll() is None:
+                        proc.kill()
+                        try:
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Close pipes
+            try:
+                if proc.stdout:
+                    proc.stdout.close()
             except Exception:
                 pass
 
